@@ -10,6 +10,9 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
+import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -235,12 +238,17 @@ public class Httpserv {
 
         String range = ex.getRequestHeaders().getFirst("Range");
         if (range != null && range.startsWith("bytes=")) {
-            long[] r = parseRange(range.substring(6), size);
-            if (r == null) {
+            List<long[]> ranges = parseRanges(range.substring(6), size);
+            if (ranges == null) {
                 h.set("Content-Range", "bytes */%d".formatted(size));
                 ex.sendResponseHeaders(416, -1);
                 return;
             }
+            if (ranges.size() > 1) {
+                serveMultipart(ex, file, size, ct, ranges, head);
+                return;
+            }
+            long[] r = ranges.get(0);
             long start = r[0], end = r[1], len = end - start + 1;
             h.set("Content-Range", "bytes %d-%d/%d".formatted(start, end, size));
             if (head) {
@@ -271,8 +279,16 @@ public class Httpserv {
         }
     }
 
-    static long[] parseRange(String spec, long size) {
-        if (spec.indexOf(',') >= 0) spec = spec.substring(0, spec.indexOf(','));
+    static List<long[]> parseRanges(String spec, long size) {
+        List<long[]> out = new ArrayList<>();
+        for (String part : spec.split(",")) {
+            long[] r = parseOne(part.trim(), size);
+            if (r != null) out.add(r);
+        }
+        return out.isEmpty() ? null : out;
+    }
+
+    static long[] parseOne(String spec, long size) {
         int dash = spec.indexOf('-');
         if (dash < 0) return null;
         String s = spec.substring(0, dash).trim();
@@ -294,6 +310,49 @@ public class Httpserv {
             return new long[]{start, end};
         } catch (NumberFormatException ex) {
             return null;
+        }
+    }
+
+    static void serveMultipart(HttpExchange ex, Path file, long size, String ct,
+                               List<long[]> ranges, boolean head) throws IOException {
+        String boundary = "httpserv_%s".formatted(Long.toHexString(System.nanoTime()));
+        byte[][] prefixes = new byte[ranges.size()][];
+        byte[] epilogue = "\r\n--%s--\r\n".formatted(boundary).getBytes(StandardCharsets.US_ASCII);
+        long total = 0;
+        for (int i = 0; i < ranges.size(); i++) {
+            long[] r = ranges.get(i);
+            String prefix = "%s--%s\r\nContent-Type: %s\r\nContent-Range: bytes %d-%d/%d\r\n\r\n".formatted(
+                    i == 0 ? "" : "\r\n", boundary, ct, r[0], r[1], size);
+            prefixes[i] = prefix.getBytes(StandardCharsets.US_ASCII);
+            total += prefixes[i].length + (r[1] - r[0] + 1);
+        }
+        total += epilogue.length;
+
+        Headers h = ex.getResponseHeaders();
+        h.set("Content-Type", "multipart/byteranges; boundary=" + boundary);
+
+        if (head) {
+            h.set("Content-Length", Long.toString(total));
+            ex.sendResponseHeaders(206, -1);
+            return;
+        }
+        ex.sendResponseHeaders(206, total);
+        try (OutputStream os = ex.getResponseBody();
+             FileChannel fc = FileChannel.open(file)) {
+            WritableByteChannel out = Channels.newChannel(os);
+            for (int i = 0; i < ranges.size(); i++) {
+                os.write(prefixes[i]);
+                long[] r = ranges.get(i);
+                long remaining = r[1] - r[0] + 1;
+                long pos = r[0];
+                while (remaining > 0) {
+                    long n = fc.transferTo(pos, remaining, out);
+                    if (n <= 0) break;
+                    pos += n;
+                    remaining -= n;
+                }
+            }
+            os.write(epilogue);
         }
     }
 

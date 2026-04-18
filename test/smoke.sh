@@ -54,6 +54,20 @@ H=$(curl -sSI -H 'Range: bytes=-100' "$BASE/big.bin")
 echo "$H" | head -1 | grep -q '206'
 echo "$H" | grep -qi '^content-range: bytes 99900-99999/100000'
 
+say "Multiple ranges returns multipart/byteranges"
+H=$(curl -sSI -H 'Range: bytes=0-9,100-109,500-599' "$BASE/big.bin")
+echo "$H" | head -1 | grep -q '206'
+echo "$H" | grep -qi '^content-type: multipart/byteranges; boundary='
+B=$(curl -sS -H 'Range: bytes=0-9,100-109,500-599' "$BASE/big.bin")
+echo "$B" | grep -q 'Content-Range: bytes 0-9/100000'
+echo "$B" | grep -q 'Content-Range: bytes 100-109/100000'
+echo "$B" | grep -q 'Content-Range: bytes 500-599/100000'
+# Content-Length matches actual body size
+CL=$(curl -sSI -H 'Range: bytes=0-9,100-109,500-599' "$BASE/big.bin" \
+        | grep -i '^content-length:' | awk '{print $2}' | tr -d '\r')
+BS=$(curl -sS -H 'Range: bytes=0-9,100-109,500-599' "$BASE/big.bin" | wc -c | tr -d ' ')
+[ "$CL" = "$BS" ]
+
 say "Unsatisfiable range returns 416"
 [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Range: bytes=999999-' "$BASE/big.bin")" = "416" ]
 
