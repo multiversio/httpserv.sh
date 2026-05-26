@@ -16,6 +16,7 @@ No build step, no dependencies — just drop `httpserv` on your `$PATH` and run.
 - Read-only: `GET`, `HEAD`, `OPTIONS`, `TRACE`
 - Optional `ETag` header (value = file's `lastModified` timestamp in millis)
 - Optional authentication: Basic, Bearer, API Key, Custom Header (repeatable, any match)
+- Network conditioning: `--latency` to simulate round-trip time to a distant bucket
 - Path-traversal protection
 - Access log includes the `Range` header when present
 
@@ -81,6 +82,8 @@ httpserv.sh [options] [directory]
   -p, --port PORT   listen port (default: 8080)
   -s, --silent      suppress access logging
   -e, --etag        send ETag header (value = lastModified millis)
+      --latency DUR fixed delay before each file response
+                      (e.g. 150ms, 2s, 1500us; bare number = ms)
   -a, --auth SPEC   require authentication (repeatable; any match passes)
                       basic:USER:PASS
                       bearer:TOKEN
@@ -121,6 +124,26 @@ A request that fails authorization gets `401 Unauthorized`. `WWW-Authenticate` c
 
 Schemes map to `io.tileverse.rangereader.http.*Authentication` classes: `BasicAuthentication`, `BearerTokenAuthentication`, `ApiKeyAuthentication`, `CustomHeaderAuthentication`. Digest is intentionally unsupported for now.
 
+## Network conditioning
+
+These flags reproduce the quirks of a remote object store so clients can be
+tested against realistic conditions.
+
+### `--latency`
+
+Adds a fixed delay before each file response is sent, simulating the round-trip
+time to a distant bucket. Virtual threads make the `sleep` cheap.
+
+```sh
+httpserv.sh --latency 150ms        # 150 ms before every file response
+httpserv.sh --latency 2s           # a painfully distant region
+httpserv.sh --latency 1500us       # sub-millisecond precision
+```
+
+Values accept a `us`, `ms`, or `s` suffix; a bare number is milliseconds. The
+delay applies only to file responses (`200`/`206`); error responses (`404`,
+`403`, `401`), redirects, and directory listings stay instant.
+
 ## Log format
 
 ```
@@ -136,8 +159,6 @@ backends (S3, GCS, Azure Blob) rather than general-purpose static hosting.
 
 ### Network conditioning
 
-- **`--latency <duration>`** — fixed delay before each response is sent. Simulates RTT
-  to a distant bucket (e.g. `--latency 150ms`). Virtual threads make `sleep` cheap.
 - **`--bandwidth <rate>`** — throttle body writes (`--bandwidth 10MB/s`). Meters bytes
   in the copy loop; swaps `InputStream.transferTo` for an explicit chunked writer.
 - **`--ttfb <duration>`** — separate "time-to-first-byte" from streaming rate so we

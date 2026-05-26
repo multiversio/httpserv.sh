@@ -33,6 +33,7 @@ public class Httpserv {
 
     static boolean silent = false;
     static boolean etag = false;
+    static long latencyNanos = 0;
     static Path root;
     static final List<Cred> authCreds = new ArrayList<>();
 
@@ -70,6 +71,7 @@ public class Httpserv {
                 case "-d", "--dir" -> dir = Path.of(args[++i]);
                 case "-s", "--silent" -> silent = true;
                 case "-e", "--etag" -> etag = true;
+                case "--latency" -> latencyNanos = parseDuration(args[++i]);
                 case "-a", "--auth" -> authCreds.add(parseAuth(args[++i]));
                 case "-h", "--help" -> { printHelp(); return; }
                 default -> {
@@ -93,6 +95,7 @@ public class Httpserv {
         server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
         server.start();
         String flags = (etag ? " [etag]" : "")
+                + (latencyNanos > 0 ? " [latency=%dms]".formatted(latencyNanos / 1_000_000) : "")
                 + (authCreds.isEmpty() ? "" : " [auth:%d]".formatted(authCreds.size()))
                 + (silent ? " [silent]" : "");
         IO.println("Serving %s at http://localhost:%d%s".formatted(root, port, flags));
@@ -106,6 +109,8 @@ public class Httpserv {
                   -p, --port PORT   listen port (default: 8080)
                   -s, --silent      suppress access logging
                   -e, --etag        send ETag header (value = lastModified millis)
+                      --latency DUR fixed delay before each file response
+                                    (e.g. 150ms, 2s, 1500us; bare number = ms)
                   -a, --auth SPEC   require authentication (repeatable; any match passes)
                                     basic:USER:PASS
                                     bearer:TOKEN
@@ -147,6 +152,32 @@ public class Httpserv {
             }
             default -> throw new IllegalArgumentException("unknown auth scheme: " + scheme);
         };
+    }
+
+    static long parseDuration(String spec) {
+        String s = spec.trim();
+        long unitNanos;
+        String number;
+        if (s.endsWith("us")) {
+            unitNanos = 1_000L;
+            number = s.substring(0, s.length() - 2);
+        } else if (s.endsWith("ms")) {
+            unitNanos = 1_000_000L;
+            number = s.substring(0, s.length() - 2);
+        } else if (s.endsWith("s")) {
+            unitNanos = 1_000_000_000L;
+            number = s.substring(0, s.length() - 1);
+        } else {
+            unitNanos = 1_000_000L;
+            number = s;
+        }
+        try {
+            double value = Double.parseDouble(number.trim());
+            if (value < 0) throw new IllegalArgumentException("negative duration: " + spec);
+            return (long) (value * unitNanos);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("bad duration: " + spec);
+        }
     }
 
     static boolean checkAuth(HttpExchange ex) throws IOException {
@@ -223,7 +254,19 @@ public class Httpserv {
         serveFile(ex, target, head);
     }
 
+    static void sleepLatency() {
+        if (latencyNanos <= 0) return;
+        long millis = latencyNanos / 1_000_000L;
+        int nanos = (int) (latencyNanos % 1_000_000L);
+        try {
+            Thread.sleep(millis, nanos);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     static void serveFile(HttpExchange ex, Path file, boolean head) throws IOException {
+        sleepLatency();
         long size = Files.size(file);
         long lastModified = Files.getLastModifiedTime(file).toMillis();
         String ct = Files.probeContentType(file);
