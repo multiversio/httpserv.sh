@@ -16,7 +16,7 @@ No build step, no dependencies — just drop `httpserv` on your `$PATH` and run.
 - Read-only: `GET`, `HEAD`, `OPTIONS`, `TRACE`
 - Optional `ETag` header (value = file's `lastModified` timestamp in millis)
 - Optional authentication: Basic, Bearer, API Key, Custom Header (repeatable, any match)
-- Network conditioning: `--latency` to simulate round-trip time to a distant bucket
+- Network conditioning: `--latency` and `--bandwidth` to simulate a distant, throttled bucket
 - Path-traversal protection
 - Access log includes the `Range` header when present
 
@@ -84,6 +84,8 @@ httpserv.sh [options] [directory]
   -e, --etag        send ETag header (value = lastModified millis)
       --latency DUR fixed delay before each file response
                       (e.g. 150ms, 2s, 1500us; bare number = ms)
+      --bandwidth RATE  throttle response body throughput
+                      (e.g. 10MB/s, 500KB/s; /s optional, 1024-based)
   -a, --auth SPEC   require authentication (repeatable; any match passes)
                       basic:USER:PASS
                       bearer:TOKEN
@@ -144,6 +146,22 @@ Values accept a `us`, `ms`, or `s` suffix; a bare number is milliseconds. The
 delay applies only to file responses (`200`/`206`); error responses (`404`,
 `403`, `401`), redirects, and directory listings stay instant.
 
+### `--bandwidth`
+
+Throttles response body throughput, metering bytes as they are written so the
+sender holds back to the configured rate. Pairs with `--latency` to model a
+high-latency, fat-pipe object store.
+
+```sh
+httpserv.sh --bandwidth 10MB/s     # cap every response body at 10 MB/s
+httpserv.sh --bandwidth 500KB/s    # a slow link
+httpserv.sh --latency 150ms --bandwidth 5MB/s   # both at once
+```
+
+Values accept `B`, `KB`, `MB`, or `GB` units (1024-based, case-insensitive); a
+bare number is bytes. The trailing `/s` is optional. The throttle covers every
+response body, including single-range and `multipart/byteranges` reads.
+
 ## Log format
 
 ```
@@ -159,8 +177,6 @@ backends (S3, GCS, Azure Blob) rather than general-purpose static hosting.
 
 ### Network conditioning
 
-- **`--bandwidth <rate>`** — throttle body writes (`--bandwidth 10MB/s`). Meters bytes
-  in the copy loop; swaps `InputStream.transferTo` for an explicit chunked writer.
 - **`--ttfb <duration>`** — separate "time-to-first-byte" from streaming rate so we
   can model high-latency-but-fat-pipe object stores independently of throughput.
 - **`--jitter <pct>`** — randomize latency/bandwidth by ±pct to avoid lockstep clients.

@@ -34,6 +34,7 @@ public class Httpserv {
     static boolean silent = false;
     static boolean etag = false;
     static long latencyNanos = 0;
+    static long bandwidthBytesPerSec = 0;
     static Path root;
     static final List<Cred> authCreds = new ArrayList<>();
 
@@ -72,6 +73,7 @@ public class Httpserv {
                 case "-s", "--silent" -> silent = true;
                 case "-e", "--etag" -> etag = true;
                 case "--latency" -> latencyNanos = parseDuration(args[++i]);
+                case "--bandwidth" -> bandwidthBytesPerSec = parseRate(args[++i]);
                 case "-a", "--auth" -> authCreds.add(parseAuth(args[++i]));
                 case "-h", "--help" -> { printHelp(); return; }
                 default -> {
@@ -96,6 +98,7 @@ public class Httpserv {
         server.start();
         String flags = (etag ? " [etag]" : "")
                 + (latencyNanos > 0 ? " [latency=%dms]".formatted(latencyNanos / 1_000_000) : "")
+                + (bandwidthBytesPerSec > 0 ? " [bw=%dKB/s]".formatted(bandwidthBytesPerSec / 1024) : "")
                 + (authCreds.isEmpty() ? "" : " [auth:%d]".formatted(authCreds.size()))
                 + (silent ? " [silent]" : "");
         IO.println("Serving %s at http://localhost:%d%s".formatted(root, port, flags));
@@ -111,6 +114,8 @@ public class Httpserv {
                   -e, --etag        send ETag header (value = lastModified millis)
                       --latency DUR fixed delay before each file response
                                     (e.g. 150ms, 2s, 1500us; bare number = ms)
+                      --bandwidth RATE  throttle response body throughput
+                                    (e.g. 10MB/s, 500KB/s; /s optional, 1024-based)
                   -a, --auth SPEC   require authentication (repeatable; any match passes)
                                     basic:USER:PASS
                                     bearer:TOKEN
@@ -180,6 +185,39 @@ public class Httpserv {
         }
     }
 
+    static long parseRate(String spec) {
+        String s = spec.trim();
+        if (s.toLowerCase().endsWith("/s")) {
+            s = s.substring(0, s.length() - 2).trim();
+        }
+        long unitBytes;
+        String number;
+        String upper = s.toUpperCase();
+        if (upper.endsWith("KB")) {
+            unitBytes = 1024L;
+            number = s.substring(0, s.length() - 2);
+        } else if (upper.endsWith("MB")) {
+            unitBytes = 1024L * 1024L;
+            number = s.substring(0, s.length() - 2);
+        } else if (upper.endsWith("GB")) {
+            unitBytes = 1024L * 1024L * 1024L;
+            number = s.substring(0, s.length() - 2);
+        } else if (upper.endsWith("B")) {
+            unitBytes = 1L;
+            number = s.substring(0, s.length() - 1);
+        } else {
+            unitBytes = 1L;
+            number = s;
+        }
+        try {
+            double value = Double.parseDouble(number.trim());
+            if (value <= 0) throw new IllegalArgumentException("rate must be positive: " + spec);
+            return (long) (value * unitBytes);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("bad rate: " + spec);
+        }
+    }
+
     static boolean checkAuth(HttpExchange ex) throws IOException {
         if (authCreds.isEmpty()) return true;
         Headers h = ex.getRequestHeaders();
@@ -229,7 +267,7 @@ public class Httpserv {
         byte[] body = sb.toString().getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().set("Content-Type", "message/http");
         ex.sendResponseHeaders(200, body.length);
-        try (OutputStream os = ex.getResponseBody()) { os.write(body); }
+        try (OutputStream os = body(ex)) { os.write(body); }
     }
 
     static void serve(HttpExchange ex, boolean head) throws IOException {
@@ -300,7 +338,7 @@ public class Httpserv {
                 return;
             }
             ex.sendResponseHeaders(206, len);
-            try (OutputStream os = ex.getResponseBody();
+            try (OutputStream os = body(ex);
                  InputStream is = Files.newInputStream(file)) {
                 is.skipNBytes(start);
                 copy(is, os, len);
@@ -315,7 +353,7 @@ public class Httpserv {
         }
         ex.sendResponseHeaders(200, size == 0 ? -1 : size);
         if (size > 0) {
-            try (OutputStream os = ex.getResponseBody();
+            try (OutputStream os = body(ex);
                  InputStream is = Files.newInputStream(file)) {
                 is.transferTo(os);
             }
@@ -380,7 +418,7 @@ public class Httpserv {
             return;
         }
         ex.sendResponseHeaders(206, total);
-        try (OutputStream os = ex.getResponseBody();
+        try (OutputStream os = body(ex);
              FileChannel fc = FileChannel.open(file)) {
             WritableByteChannel out = Channels.newChannel(os);
             for (int i = 0; i < ranges.size(); i++) {
@@ -406,6 +444,71 @@ public class Httpserv {
             if (n < 0) break;
             os.write(buf, 0, n);
             len -= n;
+        }
+    }
+
+    static OutputStream body(HttpExchange ex) {
+        OutputStream raw = ex.getResponseBody();
+        if (bandwidthBytesPerSec <= 0) return raw;
+        return new ThrottledOutputStream(raw, bandwidthBytesPerSec);
+    }
+
+    static final class ThrottledOutputStream extends OutputStream {
+        private static final int CHUNK = 16 * 1024;
+        private final OutputStream out;
+        private final long bytesPerSecond;
+        private final long startNanos = System.nanoTime();
+        private long written = 0;
+
+        ThrottledOutputStream(OutputStream out, long bytesPerSecond) {
+            this.out = out;
+            this.bytesPerSecond = bytesPerSecond;
+        }
+
+        public void write(int b) throws IOException {
+            out.write(b);
+            written++;
+            throttle();
+        }
+
+        public void write(byte[] b, int off, int len) throws IOException {
+            int pos = off;
+            int remaining = len;
+            while (remaining > 0) {
+                int n = Math.min(CHUNK, remaining);
+                out.write(b, pos, n);
+                written += n;
+                pos += n;
+                remaining -= n;
+                throttle();
+            }
+        }
+
+        public void flush() throws IOException {
+            out.flush();
+        }
+
+        public void close() throws IOException {
+            out.close();
+        }
+
+        private void throttle() throws IOException {
+            long elapsedNanos = System.nanoTime() - startNanos;
+            long sleepNanos = targetNanos() - elapsedNanos;
+            if (sleepNanos <= 0) return;
+            try {
+                Thread.sleep(sleepNanos / 1_000_000L, (int) (sleepNanos % 1_000_000L));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted while throttling", e);
+            }
+        }
+
+        private long targetNanos() {
+            long wholeSeconds = written / bytesPerSecond;
+            long remainderBytes = written % bytesPerSecond;
+            return wholeSeconds * 1_000_000_000L
+                    + remainderBytes * 1_000_000_000L / bytesPerSecond;
         }
     }
 
@@ -444,7 +547,7 @@ public class Httpserv {
             return;
         }
         ex.sendResponseHeaders(200, body.length);
-        try (OutputStream os = ex.getResponseBody()) { os.write(body); }
+        try (OutputStream os = body(ex)) { os.write(body); }
     }
 
     static void appendEntry(StringBuilder sb, Path p) {
