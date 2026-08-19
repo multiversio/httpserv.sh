@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.stream.Stream;
@@ -307,133 +308,373 @@ public class Httpserv {
         sleepLatency();
         long size = Files.size(file);
         long lastModified = Files.getLastModifiedTime(file).toMillis();
-        String ct = Files.probeContentType(file);
-        if (ct == null) ct = "application/octet-stream";
+        String contentType = probeContentType(file);
+        String lastModifiedHeader = httpDate(lastModified);
+        String entityTag = etag ? "\"%d\"".formatted(lastModified) : null;
 
         Headers h = ex.getResponseHeaders();
-        h.set("Content-Type", ct);
+        h.set("Content-Type", contentType);
         h.set("Accept-Ranges", "bytes");
-        h.set("Last-Modified", DateTimeFormatter.RFC_1123_DATE_TIME.format(
-                ZonedDateTime.ofInstant(Instant.ofEpochMilli(lastModified), ZoneOffset.UTC)));
-        if (etag) h.set("ETag", "\"%d\"".formatted(lastModified));
-
-        String range = ex.getRequestHeaders().getFirst("Range");
-        if (range != null && range.startsWith("bytes=")) {
-            List<long[]> ranges = parseRanges(range.substring(6), size);
-            if (ranges == null) {
-                h.set("Content-Range", "bytes */%d".formatted(size));
-                ex.sendResponseHeaders(416, -1);
-                return;
-            }
-            if (ranges.size() > 1) {
-                serveMultipart(ex, file, size, ct, ranges, head);
-                return;
-            }
-            long[] r = ranges.get(0);
-            long start = r[0], end = r[1], len = end - start + 1;
-            h.set("Content-Range", "bytes %d-%d/%d".formatted(start, end, size));
-            if (head) {
-                h.set("Content-Length", Long.toString(len));
-                ex.sendResponseHeaders(206, -1);
-                return;
-            }
-            ex.sendResponseHeaders(206, len);
-            try (OutputStream os = body(ex);
-                 InputStream is = Files.newInputStream(file)) {
-                is.skipNBytes(start);
-                copy(is, os, len);
-            }
-            return;
+        h.set("Last-Modified", lastModifiedHeader);
+        if (entityTag != null) {
+            h.set("ETag", entityTag);
         }
 
+        RangeOutcome outcome = evaluateRange(ex, size, entityTag, lastModifiedHeader);
+        switch (outcome.decision()) {
+            case WHOLE -> sendWholeRepresentation(ex, file, size, head);
+            case PARTIAL -> sendPartialContent(ex, file, size, contentType, outcome.ranges(), head);
+            case NOT_SATISFIABLE -> sendRangeNotSatisfiable(ex, size);
+        }
+    }
+
+    static String probeContentType(Path file) throws IOException {
+        String probed = Files.probeContentType(file);
+        return probed == null ? "application/octet-stream" : probed;
+    }
+
+    /**
+     * RFC 7231 section 7.1.1.1 requires the fixed-length IMF-fixdate form, which
+     * pads the day-of-month to two digits. RFC_1123_DATE_TIME does not pad it,
+     * and an If-Range date validator is compared by exact match.
+     */
+    static final DateTimeFormatter IMF_FIXDATE =
+            DateTimeFormatter.ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.US);
+
+    static String httpDate(long epochMillis) {
+        Instant instant = Instant.ofEpochMilli(epochMillis);
+        return IMF_FIXDATE.format(ZonedDateTime.ofInstant(instant, ZoneOffset.UTC));
+    }
+
+    /** A closed byte interval of a representation, both ends inclusive. */
+    record ByteRange(long start, long end) {
+        long length() {
+            return end - start + 1;
+        }
+    }
+
+    enum RangeDecision { WHOLE, PARTIAL, NOT_SATISFIABLE }
+
+    /** What to answer a request with; `ranges` is populated only for PARTIAL. */
+    record RangeOutcome(RangeDecision decision, List<ByteRange> ranges) {
+        static final RangeOutcome WHOLE = new RangeOutcome(RangeDecision.WHOLE, List.of());
+        static final RangeOutcome NOT_SATISFIABLE = new RangeOutcome(RangeDecision.NOT_SATISFIABLE, List.of());
+
+        static RangeOutcome partial(List<ByteRange> ranges) {
+            return new RangeOutcome(RangeDecision.PARTIAL, List.copyOf(ranges));
+        }
+    }
+
+    /**
+     * RFC 7233 section 3.1: Range applies only to units the server understands
+     * and yields to a failed If-Range precondition. Anything that leaves the
+     * header field inapplicable falls back to a 200 response.
+     *
+     * <p>Section 3.1 also says to ignore Range on methods other than GET, which
+     * would make HEAD answer 200. HEAD is evaluated here exactly like GET
+     * instead: RFC 7231 section 4.3.2 asks a HEAD response to mirror the header
+     * fields of the matching GET, and Apache, nginx, and S3 all answer 206. This
+     * server exists to stand in for those, and a client probing range support
+     * with HEAD should see what they would send.
+     */
+    static RangeOutcome evaluateRange(HttpExchange ex, long size,
+                                      String entityTag, String lastModifiedHeader) {
+        Headers request = ex.getRequestHeaders();
+        String rangeHeader = request.getFirst("Range");
+        if (rangeHeader == null) {
+            return RangeOutcome.WHOLE;
+        }
+        String ifRange = request.getFirst("If-Range");
+        if (ifRange != null && !validatorMatches(ifRange, entityTag, lastModifiedHeader)) {
+            return RangeOutcome.WHOLE;
+        }
+        String byteRangeSet = byteRangeSetOf(rangeHeader);
+        if (byteRangeSet == null) {
+            return RangeOutcome.WHOLE;
+        }
+        return parseByteRangeSet(byteRangeSet, size);
+    }
+
+    /**
+     * RFC 7233 section 3.2: the client is saying "send the range only if you
+     * still hold the representation I already have part of". A leading DQUOTE
+     * marks an entity-tag and anything else is an HTTP-date. The condition uses
+     * strong comparison, which no weak entity-tag can satisfy.
+     */
+    static boolean validatorMatches(String ifRange, String entityTag, String lastModifiedHeader) {
+        String validator = ifRange.trim();
+        if (validator.startsWith("\"")) {
+            return validator.equals(entityTag);
+        }
+        if (validator.regionMatches(true, 0, "W/\"", 0, 3)) {
+            return false;
+        }
+        return validator.equals(lastModifiedHeader);
+    }
+
+    /** Returns the byte-range-set, or null when the unit is not "bytes". */
+    static String byteRangeSetOf(String rangeHeader) {
+        String value = rangeHeader.trim();
+        String unit = "bytes=";
+        if (!value.regionMatches(true, 0, unit, 0, unit.length())) {
+            return null;
+        }
+        return value.substring(unit.length());
+    }
+
+    enum SpecKind { SATISFIABLE, UNSATISFIABLE, INVALID, MALFORMED }
+
+    /** One parsed byte-range-spec; `range` is populated only for SATISFIABLE. */
+    record SpecOutcome(SpecKind kind, ByteRange range) {
+        static final SpecOutcome UNSATISFIABLE = new SpecOutcome(SpecKind.UNSATISFIABLE, null);
+        static final SpecOutcome INVALID = new SpecOutcome(SpecKind.INVALID, null);
+        static final SpecOutcome MALFORMED = new SpecOutcome(SpecKind.MALFORMED, null);
+
+        static SpecOutcome satisfiable(long start, long end) {
+            return new SpecOutcome(SpecKind.SATISFIABLE, new ByteRange(start, end));
+        }
+    }
+
+    /**
+     * RFC 7233 sections 2.1 and 4.1: one invalid spec poisons the whole set,
+     * specs that start past the end are simply left out, and a set with nothing
+     * left to serve is unsatisfiable. Text the byte-range grammar does not cover
+     * is not a range request at all, which leaves the header field ignored.
+     */
+    static RangeOutcome parseByteRangeSet(String byteRangeSet, long size) {
+        List<ByteRange> satisfiable = new ArrayList<>();
+        boolean sawSpec = false;
+        for (String element : byteRangeSet.split(",", -1)) {
+            String spec = element.trim();
+            if (spec.isEmpty()) {
+                continue;
+            }
+            sawSpec = true;
+            SpecOutcome outcome = parseByteRangeSpec(spec, size);
+            switch (outcome.kind()) {
+                case MALFORMED -> {
+                    return RangeOutcome.WHOLE;
+                }
+                case INVALID -> {
+                    return RangeOutcome.NOT_SATISFIABLE;
+                }
+                case UNSATISFIABLE -> {
+                    continue;
+                }
+                case SATISFIABLE -> satisfiable.add(outcome.range());
+            }
+        }
+        if (!sawSpec) {
+            return RangeOutcome.WHOLE;
+        }
+        if (satisfiable.isEmpty()) {
+            return RangeOutcome.NOT_SATISFIABLE;
+        }
+        return RangeOutcome.partial(satisfiable);
+    }
+
+    static SpecOutcome parseByteRangeSpec(String spec, long size) {
+        int dash = spec.indexOf('-');
+        if (dash < 0) {
+            return SpecOutcome.MALFORMED;
+        }
+        String firstBytePos = spec.substring(0, dash).trim();
+        String lastBytePos = spec.substring(dash + 1).trim();
+        if (firstBytePos.isEmpty()) {
+            return parseSuffixByteRangeSpec(lastBytePos, size);
+        }
+        return parseFirstLastByteRangeSpec(firstBytePos, lastBytePos, size);
+    }
+
+    /** RFC 7233 section 2.1: "-N" asks for the last N bytes of the representation. */
+    static SpecOutcome parseSuffixByteRangeSpec(String suffixLength, long size) {
+        long wanted = parseByteCount(suffixLength);
+        if (wanted < 0) {
+            return SpecOutcome.MALFORMED;
+        }
+        if (wanted == 0 || size == 0) {
+            return SpecOutcome.UNSATISFIABLE;
+        }
+        long start = wanted >= size ? 0 : size - wanted;
+        return SpecOutcome.satisfiable(start, size - 1);
+    }
+
+    /** RFC 7233 section 2.1: "N-" and "N-M", where an absent M means "to the end". */
+    static SpecOutcome parseFirstLastByteRangeSpec(String firstBytePos, String lastBytePos, long size) {
+        long start = parseByteCount(firstBytePos);
+        if (start < 0) {
+            return SpecOutcome.MALFORMED;
+        }
+        long end = size - 1;
+        if (!lastBytePos.isEmpty()) {
+            end = parseByteCount(lastBytePos);
+            if (end < 0) {
+                return SpecOutcome.MALFORMED;
+            }
+            if (end < start) {
+                return SpecOutcome.INVALID;
+            }
+        }
+        if (start >= size) {
+            return SpecOutcome.UNSATISFIABLE;
+        }
+        return SpecOutcome.satisfiable(start, Math.min(end, size - 1));
+    }
+
+    /**
+     * Parses a 1*DIGIT field, returning -1 when it is not one. The grammar puts
+     * no ceiling on the digit count, and a value past long range needs no exact
+     * arithmetic: as a first-byte-pos it is unsatisfiable and as a last-byte-pos
+     * or suffix-length it covers the whole representation, so it saturates.
+     */
+    static long parseByteCount(String digits) {
+        if (digits.isEmpty()) {
+            return -1;
+        }
+        long value = 0;
+        boolean saturated = false;
+        for (int i = 0; i < digits.length(); i++) {
+            char c = digits.charAt(i);
+            if (c < '0' || c > '9') {
+                return -1;
+            }
+            if (saturated) {
+                continue;
+            }
+            int digit = c - '0';
+            if (value > (Long.MAX_VALUE - digit) / 10) {
+                value = Long.MAX_VALUE;
+                saturated = true;
+                continue;
+            }
+            value = value * 10 + digit;
+        }
+        return value;
+    }
+
+    /**
+     * States the length of the body a HEAD response must not include. The
+     * exchange would otherwise treat that length as bytes still to come.
+     */
+    static void sendHeadersOnly(HttpExchange ex, int status, long contentLength) throws IOException {
+        ex.getResponseHeaders().set("Content-Length", Long.toString(contentLength));
+        ex.sendResponseHeaders(status, -1);
+    }
+
+    static void sendWholeRepresentation(HttpExchange ex, Path file, long size, boolean head) throws IOException {
         if (head) {
-            h.set("Content-Length", Long.toString(size));
-            ex.sendResponseHeaders(200, -1);
+            sendHeadersOnly(ex, 200, size);
             return;
         }
         ex.sendResponseHeaders(200, size == 0 ? -1 : size);
-        if (size > 0) {
-            try (OutputStream os = body(ex);
-                 InputStream is = Files.newInputStream(file)) {
-                is.transferTo(os);
-            }
-        }
-    }
-
-    static List<long[]> parseRanges(String spec, long size) {
-        List<long[]> out = new ArrayList<>();
-        for (String part : spec.split(",")) {
-            long[] r = parseOne(part.trim(), size);
-            if (r != null) out.add(r);
-        }
-        return out.isEmpty() ? null : out;
-    }
-
-    static long[] parseOne(String spec, long size) {
-        int dash = spec.indexOf('-');
-        if (dash < 0) return null;
-        String s = spec.substring(0, dash).trim();
-        String e = spec.substring(dash + 1).trim();
-        try {
-            long start, end;
-            if (s.isEmpty()) {
-                if (e.isEmpty()) return null;
-                long suffix = Long.parseLong(e);
-                if (suffix <= 0) return null;
-                start = Math.max(0, size - suffix);
-                end = size - 1;
-            } else {
-                start = Long.parseLong(s);
-                end = e.isEmpty() ? size - 1 : Long.parseLong(e);
-            }
-            if (start < 0 || start > end || start >= size) return null;
-            if (end >= size) end = size - 1;
-            return new long[]{start, end};
-        } catch (NumberFormatException ex) {
-            return null;
-        }
-    }
-
-    static void serveMultipart(HttpExchange ex, Path file, long size, String ct,
-                               List<long[]> ranges, boolean head) throws IOException {
-        String boundary = "httpserv_%s".formatted(Long.toHexString(System.nanoTime()));
-        byte[][] prefixes = new byte[ranges.size()][];
-        byte[] epilogue = "\r\n--%s--\r\n".formatted(boundary).getBytes(StandardCharsets.US_ASCII);
-        long total = 0;
-        for (int i = 0; i < ranges.size(); i++) {
-            long[] r = ranges.get(i);
-            String prefix = "%s--%s\r\nContent-Type: %s\r\nContent-Range: bytes %d-%d/%d\r\n\r\n".formatted(
-                    i == 0 ? "" : "\r\n", boundary, ct, r[0], r[1], size);
-            prefixes[i] = prefix.getBytes(StandardCharsets.US_ASCII);
-            total += prefixes[i].length + (r[1] - r[0] + 1);
-        }
-        total += epilogue.length;
-
-        Headers h = ex.getResponseHeaders();
-        h.set("Content-Type", "multipart/byteranges; boundary=" + boundary);
-
-        if (head) {
-            h.set("Content-Length", Long.toString(total));
-            ex.sendResponseHeaders(206, -1);
+        if (size == 0) {
             return;
         }
-        ex.sendResponseHeaders(206, total);
         try (OutputStream os = body(ex);
-             FileChannel fc = FileChannel.open(file)) {
+             InputStream is = Files.newInputStream(file)) {
+            is.transferTo(os);
+        }
+    }
+
+    static void sendRangeNotSatisfiable(HttpExchange ex, long size) throws IOException {
+        ex.getResponseHeaders().set("Content-Range", "bytes */%d".formatted(size));
+        ex.sendResponseHeaders(416, -1);
+    }
+
+    /**
+     * RFC 7233 section 4.1: a request for one range must not be answered with a
+     * multipart payload, since a client asking for one part need not understand
+     * multipart at all.
+     */
+    static void sendPartialContent(HttpExchange ex, Path file, long size, String contentType,
+                                   List<ByteRange> ranges, boolean head) throws IOException {
+        if (ranges.size() == 1) {
+            sendSinglePart(ex, file, size, ranges.get(0), head);
+            return;
+        }
+        sendMultipart(ex, file, size, contentType, ranges, head);
+    }
+
+    static void sendSinglePart(HttpExchange ex, Path file, long size, ByteRange range, boolean head)
+            throws IOException {
+        ex.getResponseHeaders().set("Content-Range",
+                "bytes %d-%d/%d".formatted(range.start(), range.end(), size));
+        if (head) {
+            sendHeadersOnly(ex, 206, range.length());
+            return;
+        }
+        ex.sendResponseHeaders(206, range.length());
+        try (OutputStream os = body(ex);
+             InputStream is = Files.newInputStream(file)) {
+            is.skipNBytes(range.start());
+            copy(is, os, range.length());
+        }
+    }
+
+    /**
+     * RFC 7233 section 4.1 and appendix A: each part restates the representation
+     * Content-Type and its own Content-Range, the parts keep the order in which
+     * the client listed them, and the overall Content-Range header field stays
+     * off the response so a client cannot mistake this for a single-part reply.
+     */
+    static void sendMultipart(HttpExchange ex, Path file, long size, String contentType,
+                              List<ByteRange> ranges, boolean head) throws IOException {
+        String boundary = "httpserv_%016x".formatted(System.nanoTime());
+        List<byte[]> partHeaders = new ArrayList<>();
+        for (int i = 0; i < ranges.size(); i++) {
+            partHeaders.add(partHeader(boundary, contentType, size, ranges.get(i), i == 0));
+        }
+        byte[] closeDelimiter = "\r\n--%s--\r\n".formatted(boundary).getBytes(StandardCharsets.US_ASCII);
+
+        long payloadLength = multipartLength(partHeaders, ranges, closeDelimiter.length);
+
+        ex.getResponseHeaders().set("Content-Type", "multipart/byteranges; boundary=" + boundary);
+        if (head) {
+            sendHeadersOnly(ex, 206, payloadLength);
+            return;
+        }
+        ex.sendResponseHeaders(206, payloadLength);
+        try (OutputStream os = body(ex);
+             FileChannel channel = FileChannel.open(file)) {
             WritableByteChannel out = Channels.newChannel(os);
             for (int i = 0; i < ranges.size(); i++) {
-                os.write(prefixes[i]);
-                long[] r = ranges.get(i);
-                long remaining = r[1] - r[0] + 1;
-                long pos = r[0];
-                while (remaining > 0) {
-                    long n = fc.transferTo(pos, remaining, out);
-                    if (n <= 0) break;
-                    pos += n;
-                    remaining -= n;
-                }
+                os.write(partHeaders.get(i));
+                transferRange(channel, out, ranges.get(i));
             }
-            os.write(epilogue);
+            os.write(closeDelimiter);
+        }
+    }
+
+    static byte[] partHeader(String boundary, String contentType, long size, ByteRange range, boolean first) {
+        String precedingCrlf = first ? "" : "\r\n";
+        String header = "%s--%s\r\nContent-Type: %s\r\nContent-Range: bytes %d-%d/%d\r\n\r\n".formatted(
+                precedingCrlf, boundary, contentType, range.start(), range.end(), size);
+        return header.getBytes(StandardCharsets.US_ASCII);
+    }
+
+    static long multipartLength(List<byte[]> partHeaders, List<ByteRange> ranges, int closeDelimiterLength) {
+        long total = closeDelimiterLength;
+        for (int i = 0; i < ranges.size(); i++) {
+            total += partHeaders.get(i).length + ranges.get(i).length();
+        }
+        return total;
+    }
+
+    /**
+     * The Content-Length was computed from the file size, so a file truncated
+     * mid-response would leave the client waiting on bytes that never come.
+     * Fail the exchange instead of silently sending a short body.
+     */
+    static void transferRange(FileChannel channel, WritableByteChannel out, ByteRange range) throws IOException {
+        long position = range.start();
+        long remaining = range.length();
+        while (remaining > 0) {
+            long transferred = channel.transferTo(position, remaining, out);
+            if (transferred <= 0) {
+                throw new IOException("file truncated at byte %d while sending a range".formatted(position));
+            }
+            position += transferred;
+            remaining -= transferred;
         }
     }
 

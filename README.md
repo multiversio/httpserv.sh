@@ -11,7 +11,8 @@ No build step, no dependencies — just drop `httpserv` on your `$PATH` and run.
 
 - Single executable file (`httpserv`) — runs via `java --source 25`
 - Virtual-thread-per-request executor
-- HTTP Range requests (`206 Partial Content`) — useful for COGs, video, resumable downloads
+- RFC 7233 range requests: single ranges, multi-range `multipart/byteranges`, and
+  `If-Range` — useful for COGs, video, resumable downloads
 - Directory listing with sorted entries and human-readable sizes
 - Read-only: `GET`, `HEAD`, `OPTIONS`, `TRACE`
 - Optional `ETag` header (value = file's `lastModified` timestamp in millis)
@@ -60,17 +61,20 @@ curl -fsSL https://raw.githubusercontent.com/multiversio/httpserv.sh/main/httpse
 ## Testing
 
 ```sh
-make test            # runs test/run.sh (smoke + auth, using curl against a live server)
+make test            # runs test/run.sh (curl against a live server)
 ```
 
 Or drive the scripts directly:
 
 ```sh
 ./test/smoke.sh      # open-server tests
+./test/ranges.sh     # RFC 7233 range request compliance
 ./test/auth.sh       # auth + range-with-auth tests
+./test/latency.sh    # --latency
+./test/bandwidth.sh  # --bandwidth
 ```
 
-Both honor `PORT=...` and `HTTPSERV=...` env overrides. CI runs the exact same
+They all honor `PORT=...` and `HTTPSERV=...` env overrides. CI runs the exact same
 scripts — no duplicated logic.
 
 ## Usage
@@ -125,6 +129,42 @@ httpserv.sh \
 A request that fails authorization gets `401 Unauthorized`. `WWW-Authenticate` challenges are emitted for Basic and Bearer when those schemes are configured.
 
 Schemes map to `io.tileverse.rangereader.http.*Authentication` classes: `BasicAuthentication`, `BearerTokenAuthentication`, `ApiKeyAuthentication`, `CustomHeaderAuthentication`. Digest is intentionally unsupported for now.
+
+## Range requests
+
+Range handling follows [RFC 7233](https://datatracker.ietf.org/doc/html/rfc7233).
+Every file response advertises `Accept-Ranges: bytes`.
+
+- **Single range** — `206 Partial Content` with a `Content-Range` header and the
+  requested bytes as the body.
+- **Multiple ranges** — `206` with a `multipart/byteranges` payload. Each part
+  repeats the representation's `Content-Type` and states its own `Content-Range`,
+  and the parts keep the order the client listed them in. Ranges are never
+  coalesced or reordered, and there is no cap on how many a client may ask for.
+- **Suffix ranges** — `bytes=-N` returns the last N bytes; an N larger than the
+  file returns the whole file.
+- **Clamping** — a `last-byte-pos` past the end of the file is clamped to the
+  last byte.
+- **`If-Range`** — evaluated against the `ETag` (with `--etag`) and against
+  `Last-Modified`, using strong comparison. A validator that no longer matches
+  makes the server ignore `Range` and answer `200` with the whole file, which is
+  what lets a client resume a download without splicing stale bytes.
+
+`416 Range Not Satisfiable`, with `Content-Range: bytes */<length>`, comes back
+when no requested range overlaps the file, when a suffix length is zero, or when
+any spec is invalid (`last-byte-pos` before `first-byte-pos`). One invalid spec
+rejects the whole set.
+
+`Range` is ignored, and the whole file returned, when the range unit is not
+`bytes` or when the header value does not parse as a byte-range-set.
+
+`HEAD` is answered from the same evaluation as `GET`: same status, same
+`Content-Range`, same `Content-Length`, no body. RFC 7233 section 3.1 asks
+servers to ignore `Range` on any method other than `GET`, but Apache, nginx,
+Caddy and S3 all answer `206` here, and RFC 7231 section 4.3.2 asks a `HEAD`
+response to mirror the header fields of the matching `GET`. Standing in for
+those object stores matters more here than the letter of section 3.1, so a
+client probing range support with `HEAD` sees what they would send.
 
 ## Network conditioning
 
@@ -194,8 +234,6 @@ backends (S3, GCS, Azure Blob) rather than general-purpose static hosting.
 
 - **Conditional requests** — honor `If-None-Match` / `If-Modified-Since` → `304 Not
   Modified`. Pairs with the existing `--etag` flag to validate cache logic.
-- **Multipart byte-ranges** — respond `multipart/byteranges` when a client sends
-  multiple ranges in a single `Range:` header. Real COG readers sometimes coalesce.
 - **`--tls`** — serve over HTTPS with an on-the-fly self-signed certificate. Some
   libraries take different code paths on TLS (connection pooling, ALPN, etc.).
 
