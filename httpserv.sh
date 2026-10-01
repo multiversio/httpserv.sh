@@ -27,17 +27,52 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
 public class Httpserv {
 
     static boolean silent = false;
     static boolean etag = false;
-    static long latencyNanos = 0;
-    static long bandwidthBytesPerSec = 0;
+    static volatile long latencyNanos = 0;
+    static volatile long bandwidthBytesPerSec = 0;
     static Path root;
     static final List<Cred> authCreds = new ArrayList<>();
+
+    static final LongAdder requests = new LongAdder();
+    static final LongAdder rangeSpecs = new LongAdder();
+    static final LongAdder wholeResponses = new LongAdder();
+    static final LongAdder singleRangeResponses = new LongAdder();
+    static final LongAdder multipartResponses = new LongAdder();
+
+    /**
+     * Bytes written to file and directory responses. Admin replies bypass the counters; polling a run
+     * does not change its own numbers.
+     */
+    static final LongAdder bytesSent = new LongAdder();
+
+    static final ConcurrentMap<Integer, LongAdder> statusCounts = new ConcurrentHashMap<>();
+    static final BandwidthBudget bandwidthBudget = new BandwidthBudget();
+
+    /** Sends a response status and counts it. Admin replies do not come through here. */
+    static void respondWith(HttpExchange ex, int status, long contentLength) throws IOException {
+        statusCounts.computeIfAbsent(status, s -> new LongAdder()).increment();
+        ex.sendResponseHeaders(status, contentLength);
+    }
+
+    static void countRequest(HttpExchange ex) {
+        requests.increment();
+        String range = ex.getRequestHeaders().getFirst("Range");
+        if (range == null) {
+            return;
+        }
+        rangeSpecs.add(range.chars().filter(c -> c == ',').count() + 1);
+    }
 
     sealed interface Cred permits BasicCred, BearerCred, HeaderCred {
         boolean matches(Headers h);
@@ -95,6 +130,7 @@ public class Httpserv {
 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/", Httpserv::handle);
+        server.createContext("/_admin", Httpserv::admin);
         server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
         server.start();
         String flags = (etag ? " [etag]" : "")
@@ -115,7 +151,7 @@ public class Httpserv {
                   -e, --etag        send ETag header (value = lastModified millis)
                       --latency DUR fixed delay before each file response
                                     (e.g. 150ms, 2s, 1500us; bare number = ms)
-                      --bandwidth RATE  throttle response body throughput
+                      --bandwidth RATE  throttle the whole server's throughput
                                     (e.g. 10MB/s, 500KB/s; /s optional, 1024-based)
                   -a, --auth SPEC   require authentication (repeatable; any match passes)
                                     basic:USER:PASS
@@ -123,6 +159,14 @@ public class Httpserv {
                                     api-key:HEADER:VALUE
                                     header:H1=V1,H2=V2,...   (all headers required)
                   -h, --help        show this help
+
+                Lab endpoints, always on:
+                  POST /_admin/conditioning?latency=25ms&bandwidth=125MB/s
+                                    move either knob under a running server
+                  GET  /_admin/conditioning    read both knobs back
+                  GET  /_admin/counters        requests, range specs, response
+                                    shapes, statuses and bytes since the reset
+                  POST /_admin/counters/reset  zero all of them
                 """);
     }
 
@@ -228,12 +272,111 @@ public class Httpserv {
         boolean hasBearer = authCreds.stream().anyMatch(c -> c instanceof BearerCred);
         if (hasBasic) resp.add("WWW-Authenticate", "Basic realm=\"httpserv\"");
         if (hasBearer) resp.add("WWW-Authenticate", "Bearer realm=\"httpserv\"");
-        ex.sendResponseHeaders(401, -1);
+        respondWith(ex, 401, -1);
         return false;
+    }
+
+    /** The lab endpoints, on their own context: unpaced and uncounted. */
+    static void admin(HttpExchange ex) {
+        try (ex) {
+            switch (ex.getRequestURI().getPath()) {
+                case "/_admin/counters" -> sendJson(ex, countersJson());
+                case "/_admin/counters/reset" -> resetCounters(ex);
+                case "/_admin/conditioning" -> conditioning(ex);
+                default -> ex.sendResponseHeaders(404, -1);
+            }
+        } catch (Throwable t) {
+            if (!silent) {
+                t.printStackTrace();
+            }
+        }
+    }
+
+    static void resetCounters(HttpExchange ex) throws IOException {
+        requests.reset();
+        rangeSpecs.reset();
+        wholeResponses.reset();
+        singleRangeResponses.reset();
+        multipartResponses.reset();
+        bytesSent.reset();
+        statusCounts.clear();
+        ex.sendResponseHeaders(204, -1);
+    }
+
+    /** GET reads latency and bandwidth; POST replaces the ones named and leaves the rest. */
+    static void conditioning(HttpExchange ex) throws IOException {
+        if ("POST".equals(ex.getRequestMethod())) {
+            Map<String, String> query = queryOf(ex.getRequestURI().getRawQuery());
+            String latency = query.get("latency");
+            if (latency != null) {
+                latencyNanos = parseDuration(latency);
+            }
+            String bandwidth = query.get("bandwidth");
+            if (bandwidth != null) {
+                bandwidthBytesPerSec = parseAdminRate(bandwidth);
+            }
+        }
+        sendJson(ex, "{\"latencyMillis\":%d,\"bandwidthBytesPerSecond\":%d}"
+                .formatted(latencyNanos / 1_000_000L, bandwidthBytesPerSec));
+    }
+
+    /** A bandwidth value from the admin endpoint; {@code 0} turns the throttle off. */
+    static long parseAdminRate(String spec) {
+        if ("0".equals(spec.trim())) {
+            return 0;
+        }
+        return parseRate(spec);
+    }
+
+    static Map<String, String> queryOf(String rawQuery) {
+        Map<String, String> query = new LinkedHashMap<>();
+        if (rawQuery == null || rawQuery.isBlank()) {
+            return query;
+        }
+        for (String pair : rawQuery.split("&")) {
+            int eq = pair.indexOf('=');
+            if (eq > 0) {
+                query.put(
+                        URLDecoder.decode(pair.substring(0, eq), StandardCharsets.UTF_8),
+                        URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8));
+            }
+        }
+        return query;
+    }
+
+    static String countersJson() {
+        StringBuilder statuses = new StringBuilder();
+        for (Map.Entry<Integer, LongAdder> entry : new TreeMap<>(statusCounts).entrySet()) {
+            if (!statuses.isEmpty()) {
+                statuses.append(',');
+            }
+            statuses.append("\"%d\":%d".formatted(entry.getKey(), entry.getValue().sum()));
+        }
+        return ("{\"requests\":%d,\"rangeSpecs\":%d,\"wholeResponses\":%d,\"singleRangeResponses\":%d,"
+                        + "\"multipartResponses\":%d,\"bytesSent\":%d,\"status\":{%s}}")
+                .formatted(
+                        requests.sum(),
+                        rangeSpecs.sum(),
+                        wholeResponses.sum(),
+                        singleRangeResponses.sum(),
+                        multipartResponses.sum(),
+                        bytesSent.sum(),
+                        statuses);
+    }
+
+    /** Writes an admin reply straight to the exchange: uncounted and unpaced. */
+    static void sendJson(HttpExchange ex, String json) throws IOException {
+        byte[] payload = json.getBytes(StandardCharsets.UTF_8);
+        ex.getResponseHeaders().set("Content-Type", "application/json");
+        ex.sendResponseHeaders(200, payload.length);
+        try (OutputStream os = ex.getResponseBody()) {
+            os.write(payload);
+        }
     }
 
     static void handle(HttpExchange ex) {
         try (ex) {
+            countRequest(ex);
             log(ex);
             if (!checkAuth(ex)) return;
             switch (ex.getRequestMethod()) {
@@ -243,7 +386,7 @@ public class Httpserv {
                 case "TRACE"   -> trace(ex);
                 default -> {
                     ex.getResponseHeaders().set("Allow", "GET, HEAD, OPTIONS, TRACE");
-                    ex.sendResponseHeaders(405, -1);
+                    respondWith(ex, 405, -1);
                 }
             }
         } catch (Throwable t) {
@@ -253,7 +396,7 @@ public class Httpserv {
 
     static void options(HttpExchange ex) throws IOException {
         ex.getResponseHeaders().set("Allow", "GET, HEAD, OPTIONS, TRACE");
-        ex.sendResponseHeaders(204, -1);
+        respondWith(ex, 204, -1);
     }
 
     static void trace(HttpExchange ex) throws IOException {
@@ -267,7 +410,7 @@ public class Httpserv {
         sb.append("\r\n");
         byte[] body = sb.toString().getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().set("Content-Type", "message/http");
-        ex.sendResponseHeaders(200, body.length);
+        respondWith(ex, 200, body.length);
         try (OutputStream os = body(ex)) { os.write(body); }
     }
 
@@ -276,13 +419,13 @@ public class Httpserv {
         String decoded = URLDecoder.decode(rawPath, StandardCharsets.UTF_8);
         String rel = decoded.startsWith("/") ? decoded.substring(1) : decoded;
         Path target = root.resolve(rel).normalize();
-        if (!target.startsWith(root)) { ex.sendResponseHeaders(403, -1); return; }
-        if (!Files.exists(target))    { ex.sendResponseHeaders(404, -1); return; }
+        if (!target.startsWith(root)) { respondWith(ex, 403, -1); return; }
+        if (!Files.exists(target))    { respondWith(ex, 404, -1); return; }
 
         if (Files.isDirectory(target)) {
             if (!rawPath.endsWith("/")) {
                 ex.getResponseHeaders().set("Location", rawPath + "/");
-                ex.sendResponseHeaders(301, -1);
+                respondWith(ex, 301, -1);
                 return;
             }
             Path index = target.resolve("index.html");
@@ -558,7 +701,7 @@ public class Httpserv {
      */
     static void sendHeadersOnly(HttpExchange ex, int status, long contentLength) throws IOException {
         ex.getResponseHeaders().set("Content-Length", Long.toString(contentLength));
-        ex.sendResponseHeaders(status, -1);
+        respondWith(ex, status, -1);
     }
 
     static void sendWholeRepresentation(HttpExchange ex, Path file, long size, boolean head) throws IOException {
@@ -566,7 +709,8 @@ public class Httpserv {
             sendHeadersOnly(ex, 200, size);
             return;
         }
-        ex.sendResponseHeaders(200, size == 0 ? -1 : size);
+        wholeResponses.increment();
+        respondWith(ex, 200, size == 0 ? -1 : size);
         if (size == 0) {
             return;
         }
@@ -578,7 +722,7 @@ public class Httpserv {
 
     static void sendRangeNotSatisfiable(HttpExchange ex, long size) throws IOException {
         ex.getResponseHeaders().set("Content-Range", "bytes */%d".formatted(size));
-        ex.sendResponseHeaders(416, -1);
+        respondWith(ex, 416, -1);
     }
 
     /**
@@ -603,7 +747,8 @@ public class Httpserv {
             sendHeadersOnly(ex, 206, range.length());
             return;
         }
-        ex.sendResponseHeaders(206, range.length());
+        singleRangeResponses.increment();
+        respondWith(ex, 206, range.length());
         try (OutputStream os = body(ex);
              InputStream is = Files.newInputStream(file)) {
             is.skipNBytes(range.start());
@@ -633,7 +778,8 @@ public class Httpserv {
             sendHeadersOnly(ex, 206, payloadLength);
             return;
         }
-        ex.sendResponseHeaders(206, payloadLength);
+        multipartResponses.increment();
+        respondWith(ex, 206, payloadLength);
         try (OutputStream os = body(ex);
              FileChannel channel = FileChannel.open(file)) {
             WritableByteChannel out = Channels.newChannel(os);
@@ -688,68 +834,98 @@ public class Httpserv {
         }
     }
 
+    /** Wraps the body even with the throttle off: the counter still needs the writes. */
     static OutputStream body(HttpExchange ex) {
-        OutputStream raw = ex.getResponseBody();
-        if (bandwidthBytesPerSec <= 0) return raw;
-        return new ThrottledOutputStream(raw, bandwidthBytesPerSec);
+        return new MeteredOutputStream(ex.getResponseBody());
     }
 
-    static final class ThrottledOutputStream extends OutputStream {
+    /** Counts the bytes it writes and paces them against the server-wide budget. */
+    static final class MeteredOutputStream extends OutputStream {
         private static final int CHUNK = 16 * 1024;
         private final OutputStream out;
-        private final long bytesPerSecond;
-        private final long startNanos = System.nanoTime();
-        private long written = 0;
 
-        ThrottledOutputStream(OutputStream out, long bytesPerSecond) {
+        MeteredOutputStream(OutputStream out) {
             this.out = out;
-            this.bytesPerSecond = bytesPerSecond;
         }
 
+        @Override
         public void write(int b) throws IOException {
             out.write(b);
-            written++;
-            throttle();
+            meter(1);
         }
 
+        @Override
         public void write(byte[] b, int off, int len) throws IOException {
             int pos = off;
             int remaining = len;
             while (remaining > 0) {
                 int n = Math.min(CHUNK, remaining);
                 out.write(b, pos, n);
-                written += n;
                 pos += n;
                 remaining -= n;
-                throttle();
+                meter(n);
             }
         }
 
+        @Override
         public void flush() throws IOException {
             out.flush();
         }
 
+        @Override
         public void close() throws IOException {
             out.close();
         }
 
-        private void throttle() throws IOException {
-            long elapsedNanos = System.nanoTime() - startNanos;
-            long sleepNanos = targetNanos() - elapsedNanos;
-            if (sleepNanos <= 0) return;
+        private void meter(int n) throws IOException {
+            bytesSent.add(n);
+            bandwidthBudget.consume(n);
+        }
+    }
+
+    /**
+     * One transfer budget for the whole server. A per-response throttle would give N parallel
+     * responses the full rate each; a real client has one link.
+     */
+    static final class BandwidthBudget {
+        private final ReentrantLock lock = new ReentrantLock();
+        private long nextFreeNanos = System.nanoTime();
+
+        void consume(int bytes) throws IOException {
+            long rate = bandwidthBytesPerSec;
+            if (rate <= 0) {
+                return;
+            }
+            long releaseAt = reserve(bytes, rate);
+            sleepUntil(releaseAt);
+        }
+
+        private long reserve(int bytes, long rate) {
+            lock.lock();
             try {
-                Thread.sleep(sleepNanos / 1_000_000L, (int) (sleepNanos % 1_000_000L));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IOException("interrupted while throttling", e);
+                long now = System.nanoTime();
+                if (nextFreeNanos < now) {
+                    nextFreeNanos = now;
+                }
+                long releaseAt = nextFreeNanos;
+                nextFreeNanos += bytes * 1_000_000_000L / rate;
+                return releaseAt;
+            } finally {
+                lock.unlock();
             }
         }
 
-        private long targetNanos() {
-            long wholeSeconds = written / bytesPerSecond;
-            long remainderBytes = written % bytesPerSecond;
-            return wholeSeconds * 1_000_000_000L
-                    + remainderBytes * 1_000_000_000L / bytesPerSecond;
+        private static void sleepUntil(long releaseAt) throws IOException {
+            long waitNanos = releaseAt - System.nanoTime();
+            if (waitNanos <= 0) {
+                return;
+            }
+            try {
+                Thread.sleep(waitNanos / 1_000_000L, (int) (waitNanos % 1_000_000L));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted while pacing a response", e);
+            }
         }
     }
 
@@ -784,10 +960,10 @@ public class Httpserv {
         ex.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
         if (head) {
             ex.getResponseHeaders().set("Content-Length", Integer.toString(body.length));
-            ex.sendResponseHeaders(200, -1);
+            respondWith(ex, 200, -1);
             return;
         }
-        ex.sendResponseHeaders(200, body.length);
+        respondWith(ex, 200, body.length);
         try (OutputStream os = body(ex)) { os.write(body); }
     }
 

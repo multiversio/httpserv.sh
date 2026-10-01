@@ -72,6 +72,7 @@ Or drive the scripts directly:
 ./test/auth.sh       # auth + range-with-auth tests
 ./test/latency.sh    # --latency
 ./test/bandwidth.sh  # --bandwidth
+./test/admin.sh      # lab endpoints: counters and runtime conditioning
 ```
 
 They all honor `PORT=...` and `HTTPSERV=...` env overrides. CI runs the exact same
@@ -86,9 +87,11 @@ httpserv.sh [options] [directory]
   -p, --port PORT   listen port (default: 8080)
   -s, --silent      suppress access logging
   -e, --etag        send ETag header (value = lastModified millis)
-      --latency DUR fixed delay before each file response
+      --latency DUR fixed delay before each file response; a starting
+                    value, replaceable at runtime by the lab endpoint
                       (e.g. 150ms, 2s, 1500us; bare number = ms)
-      --bandwidth RATE  throttle response body throughput
+      --bandwidth RATE  throttle the whole server's response throughput;
+                    a starting value, replaceable by the lab endpoint
                       (e.g. 10MB/s, 500KB/s; /s optional, 1024-based)
   -a, --auth SPEC   require authentication (repeatable; any match passes)
                       basic:USER:PASS
@@ -188,9 +191,9 @@ delay applies only to file responses (`200`/`206`); error responses (`404`,
 
 ### `--bandwidth`
 
-Throttles response body throughput, metering bytes as they are written so the
-sender holds back to the configured rate. Pairs with `--latency` to model a
-high-latency, fat-pipe object store.
+Throttles response body throughput against one budget for the whole server,
+metering bytes as they are written and holding the sender back to the configured
+rate. Pairs with `--latency` to model a high-latency, fat-pipe object store.
 
 ```sh
 httpserv.sh --bandwidth 10MB/s     # cap every response body at 10 MB/s
@@ -201,6 +204,42 @@ httpserv.sh --latency 150ms --bandwidth 5MB/s   # both at once
 Values accept `B`, `KB`, `MB`, or `GB` units (1024-based, case-insensitive); a
 bare number is bytes. The trailing `/s` is optional. The throttle covers every
 response body, including single-range and `multipart/byteranges` reads.
+
+One budget covers the whole server rather than one budget per response. Eight
+parallel reads share the configured rate, the way they share a real link; a
+per-response throttle would hand each of them the full rate and a client that
+merged its ranges would appear to gain nothing.
+
+### Lab endpoints
+
+Three endpoints on the `/_admin` context serve a measurement run. They are always
+on, and they stay outside every counter and outside the bandwidth budget: a run's
+own polling never lands in its own numbers.
+
+```sh
+curl -X POST 'localhost:8080/_admin/conditioning?latency=25ms&bandwidth=125MB/s'
+curl localhost:8080/_admin/conditioning
+# {"latencyMillis":25,"bandwidthBytesPerSecond":131072000}
+```
+
+`POST /_admin/conditioning` replaces the named halves of the conditioning under a
+running server; an omitted half is left alone, and a bare `0` turns that half off.
+`GET` reads it back.
+
+```sh
+curl -X POST localhost:8080/_admin/counters/reset
+# ... the run ...
+curl localhost:8080/_admin/counters
+# {"requests":41,"rangeSpecs":2317,"wholeResponses":0,"singleRangeResponses":3,
+#  "multipartResponses":38,"bytesSent":248901123,"status":{"206":41}}
+```
+
+`GET /_admin/counters` reports what the server actually served since the last
+reset: requests, the range specs summed over every `Range` header, the three
+response shapes, the bytes written, and the status histogram. `POST
+/_admin/counters/reset` zeroes all of them and answers `204`. A client that
+believes it moved N bytes can be checked against `bytesSent`, and the count of
+merged fetches against `requests`.
 
 ## Log format
 
@@ -220,6 +259,10 @@ backends (S3, GCS, Azure Blob) rather than general-purpose static hosting.
 - **`--ttfb <duration>`** — separate "time-to-first-byte" from streaming rate so we
   can model high-latency-but-fat-pipe object stores independently of throughput.
 - **`--jitter <pct>`** — randomize latency/bandwidth by ±pct to avoid lockstep clients.
+
+Runtime conditioning is delivered: `POST /_admin/conditioning` moves latency and
+bandwidth under a running server, hence a sweep over network profiles needs no
+restart between points.
 
 ### Failure injection
 
@@ -243,6 +286,11 @@ backends (S3, GCS, Azure Blob) rather than general-purpose static hosting.
   bytes sent, duration. Grep-able for perf regressions and request-pattern asserts.
 - **Replay / whitelist mode** — load a manifest of allowed URL+range pairs; anything
   outside returns `403`. Lets tests assert the exact request pattern a client made.
+
+The counting half of both items is delivered: `GET /_admin/counters` reports the
+requests, range specs, response shapes, statuses and bytes of a window bounded by
+a reset, which is what a perf run and a request-pattern assert need. A structured
+per-request log remains open.
 
 CORS is intentionally out of scope: consumers like GeoServer proxy requests
 server-side, so the browser never talks to `httpserv` directly.
